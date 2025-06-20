@@ -1,5 +1,6 @@
 import requests
 import os
+import time
 from datetime import datetime
 
 # --- Configs ---
@@ -29,11 +30,14 @@ def get_top_coins():
         "limit": "200",
         "convert": "USD"
     }
-    response = requests.get(url, headers=HEADERS, params=params)
-    if response.status_code != 200:
-        print("Error fetching coins")
+    try:
+        response = requests.get(url, headers=HEADERS, params=params)
+        if response.status_code != 200:
+            print("Error fetching coins")
+            return []
+        return response.json().get("data", [])
+    except:
         return []
-    return response.json().get("data", [])
 
 # --- Filter for KuCoin ---
 def is_on_kucoin(symbol):
@@ -42,19 +46,22 @@ def is_on_kucoin(symbol):
         "symbol": symbol,
         "limit": 50
     }
-    response = requests.get(url, headers=HEADERS, params=params)
-    if response.status_code != 200:
+    try:
+        response = requests.get(url, headers=HEADERS, params=params)
+        if response.status_code != 200:
+            return False
+        pairs = response.json().get("data", {}).get("market_pairs", [])
+        for pair in pairs:
+            if pair.get("exchange", {}).get("name") == EXCHANGE_FILTER:
+                return True
+    except:
         return False
-    pairs = response.json().get("data", {}).get("market_pairs", [])
-    for pair in pairs:
-        if pair.get("exchange", {}).get("name") == EXCHANGE_FILTER:
-            return True
     return False
 
 # --- Send to Telegram ---
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, data=data)
     except:
@@ -66,13 +73,15 @@ def scan():
     matching_coins = []
 
     for coin in coins:
-        quote = coin["quote"]["USD"]
-        price = quote["price"]
-        volume = quote["volume_24h"]
+        quote = coin.get("quote", {}).get("USD", {})
+        price = quote.get("price")
+        volume = quote.get("volume_24h")
         change = quote.get("percent_change_1h") or 0
-        symbol = coin["symbol"]
-        name = coin["name"]
+        symbol = coin.get("symbol")
+        name = coin.get("name")
 
+        if not all([price, volume, symbol, name]):
+            continue
         if not (MIN_PRICE <= price <= MAX_PRICE):
             continue
         if volume < MIN_VOLUME:
@@ -91,12 +100,15 @@ def scan():
     matching_coins.sort(key=lambda x: x[-1], reverse=True)
     top_5 = matching_coins[:5]
 
-    msg = "\U0001F680 *Top 5 KuCoin Cryptos (1H)*:\n"
+    now_str = datetime.now().strftime("%H:%M UTC")
+    msg = f"\U0001F680 *Top 5 KuCoin Cryptos (1H) @ {now_str}*:\n"
     for coin in top_5:
         msg += f"- {coin[1]} (${coin[0]}): {coin[4]:.2f}% | Price: ${coin[2]:.4f} | Volume: ${coin[3]:,.2f}\n"
 
     send_telegram_message(msg)
 
-# --- Run Now ---
+# --- Run Loop ---
 if __name__ == '__main__':
-    scan()
+    while True:
+        scan()
+        time.sleep(600)  # run every 10 minutes
