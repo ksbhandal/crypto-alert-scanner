@@ -1,96 +1,147 @@
 import os
 import requests
+from datetime import datetime
 from flask import Flask
-import threading
+import pytz
 import time
-
-API_KEY = os.environ.get("API_KEY")
-BOT_TOKEN = os.environ.get("bot_token")
-CHAT_ID = os.environ.get("chat_id")
+import threading
 
 app = Flask(__name__)
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+BOT_TOKEN = os.environ.get("bot_token")
+CHAT_ID = os.environ.get("chat_id")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+
+HEADERS = {
+    "X-Finnhub-Token": FINNHUB_API_KEY
+}
+
+EXCHANGES = ["US"]
+PRICE_LIMIT = 5.00
+GAP_PERCENT = 20
+VOLUME_MIN = 100000
+REL_VOL_MIN = 2
+TIMEZONE = pytz.timezone("US/Eastern")
+SCAN_HOURS = range(4, 9)  # 4 AM to 8:59 AM EST
+
+# To store last known %change per stock
+last_seen_change = {}
+
+
+def is_premarket():
+    now = datetime.now(TIMEZONE)
+    return now.hour in SCAN_HOURS
+
+
+def fetch_stocks():
+    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
+    res = requests.get(url)
+    if res.status_code == 200:
+        return [s['symbol'] for s in res.json() if s.get("type") == "Common Stock"]
+    return []
+
+
+def get_metrics(symbol):
     try:
-        requests.post(url, data=payload)
+        quote = requests.get(f"https://finnhub.io/api/v1/quote?symbol={symbol}", headers=HEADERS).json()
+        profile = requests.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}", headers=HEADERS).json()
+        stats = requests.get(f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all", headers=HEADERS).json()
+
+        return {
+            "symbol": symbol,
+            "current_price": quote.get("c"),
+            "previous_close": quote.get("pc"),
+            "market_cap": profile.get("marketCapitalization"),
+            "volume": quote.get("v"),
+            "rel_vol": stats.get("metric", {}).get("relativeVolume")
+        }
+    except:
+        return None
+
+
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text}
+    try:
+        requests.post(url, data=data)
     except:
         pass
 
-def get_top_5_cryptos():
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-    headers = {
-        "Accepts": "application/json",
-        "X-CMC_PRO_API_KEY": API_KEY
-    }
-    params = {
-        "start": "1",
-        "limit": "5000",
-        "convert": "USD"
-    }
 
-    response = requests.get(url, headers=headers, params=params)
-    data = response.json()
+def scan_and_alert():
+    if not is_premarket():
+        return
 
-    filtered = []
-    for coin in data.get("data", []):
-        quote = coin.get("quote", {}).get("USD", {})
-        price = quote.get("price")
-        market_cap = quote.get("market_cap")
-        volume_24h = quote.get("volume_24h")
-        percent_change_15m = quote.get("percent_change_15m")
-        percent_change_1h = quote.get("percent_change_1h")
+    now_str = datetime.now(TIMEZONE).strftime("%I:%M %p EST")
+    symbols = fetch_stocks()
+    found_stocks = []
 
-        timeframe = None
-        if percent_change_15m is not None and percent_change_15m > 10:
-            percent_change = percent_change_15m
-            timeframe = "15m"
-        elif percent_change_1h is not None and percent_change_1h > 10:
-            percent_change = percent_change_1h
-            timeframe = "1h"
-        else:
+    for symbol in symbols:
+        metrics = get_metrics(symbol)
+        if not metrics:
             continue
 
-        if None in [price, market_cap, volume_24h, percent_change]:
+        price = metrics["current_price"]
+        prev_close = metrics["previous_close"]
+        cap = metrics["market_cap"]
+        volume = metrics["volume"]
+        rel_vol = metrics["rel_vol"]
+
+        if not all([price, prev_close, cap, volume, rel_vol]):
             continue
 
-        if (
-            0.1 <= price <= 10 and
-            market_cap < 300_000_000 and
-            volume_24h > 500_000
-        ):
-            filtered.append({
-                "symbol": coin.get("symbol"),
-                "name": coin.get("name"),
-                "price": price,
-                "market_cap": market_cap,
-                "volume": volume_24h,
-                "change": percent_change,
-                "timeframe": timeframe
-            })
+        if price > PRICE_LIMIT:
+            continue
 
-    top_5 = sorted(filtered, key=lambda x: x["change"], reverse=True)[:5]
+        percent_change = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+        if percent_change < GAP_PERCENT:
+            continue
 
-    if top_5:
-        message = "\U0001F680 Top 5 Exploding Cryptos:\n"
-        for coin in top_5:
-            message += (f"- {coin['name']} (${coin['symbol']}): {coin['change']:.2f}% ({coin['timeframe']})\n"
-                        f"Price: ${coin['price']:.4f}\nVol: ${coin['volume']:,}\n\n")
-        send_telegram_message(message.strip())
+        if volume < VOLUME_MIN:
+            continue
+
+        if rel_vol < REL_VOL_MIN:
+            continue
+
+        change_diff = ""
+        last_change = last_seen_change.get(symbol)
+        if last_change is not None:
+            delta = percent_change - last_change
+            if abs(delta) > 1:
+                change_diff = f" (Δ {delta:+.1f}%)"
+
+        last_seen_change[symbol] = percent_change
+
+        msg = (f"🔥 ${symbol} ALERT @ {now_str}
+"
+               f"Price: ${price:.2f} | Prev Close: ${prev_close:.2f}
+"
+               f"Change: {percent_change:.1f}%{change_diff}
+"
+               f"Volume: {volume:,} | Rel Vol: {rel_vol:.2f}
+"
+               f"Market Cap: ${cap:.0f}M")
+
+        found_stocks.append(msg)
+
+    if found_stocks:
+        send_telegram_message(f"🔍 Pre-market Scan @ {now_str}\n\n" + "\n\n".join(found_stocks))
     else:
-        send_telegram_message("No coins found meeting the criteria.")
+        send_telegram_message(f"🔍 Pre-market Scan @ {now_str}: No stocks found.")
+
 
 @app.route("/")
 def home():
-    return "Crypto scanner running..."
+    return "Pre-market scanner online."
+
 
 @app.route("/scan")
 def scan():
-    get_top_5_cryptos()
-    return "Scan done."
+    scan_and_alert()
+    return "Scan completed."
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     def ping_self():
         while True:
             try:
