@@ -1,114 +1,103 @@
-import requests
 import os
+import requests
+from flask import Flask
+import threading
 import time
-from datetime import datetime
 
-# --- Configs ---
-API_KEY = os.environ.get("CMC_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("bot_token")
-TELEGRAM_CHAT_ID = os.environ.get("chat_id")
-CMC_BASE_URL = "https://pro-api.coinmarketcap.com/v1"
+API_KEY = os.environ.get("API_KEY")
+BOT_TOKEN = os.environ.get("bot_token")
+CHAT_ID = os.environ.get("chat_id")
 
-# --- Filtering Criteria ---
-MAX_PRICE = 10.0
-MIN_PRICE = 0.1
-MIN_VOLUME = 500_000
-MIN_PERCENT_CHANGE = 10
-EXCHANGE_FILTER = "KuCoin"
+app = Flask(__name__)
 
-# --- Headers ---
-HEADERS = {
-    "Accepts": "application/json",
-    "X-CMC_PRO_API_KEY": API_KEY,
-}
-
-# --- Get Crypto List ---
-def get_top_coins():
-    url = f"{CMC_BASE_URL}/cryptocurrency/listings/latest"
-    params = {
-        "start": "1",
-        "limit": "200",
-        "convert": "USD"
-    }
-    try:
-        response = requests.get(url, headers=HEADERS, params=params)
-        if response.status_code != 200:
-            print("Error fetching coins")
-            return []
-        return response.json().get("data", [])
-    except:
-        return []
-
-# --- Filter for KuCoin ---
-def is_on_kucoin(symbol):
-    url = f"{CMC_BASE_URL}/cryptocurrency/market-pairs/latest"
-    params = {
-        "symbol": symbol,
-        "limit": 50
-    }
-    try:
-        response = requests.get(url, headers=HEADERS, params=params)
-        if response.status_code != 200:
-            return False
-        pairs = response.json().get("data", {}).get("market_pairs", [])
-        for pair in pairs:
-            if pair.get("exchange", {}).get("name") == EXCHANGE_FILTER:
-                return True
-    except:
-        return False
-    return False
-
-# --- Send to Telegram ---
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data)
+        requests.post(url, data=payload)
     except:
         pass
 
-# --- Scan Logic ---
-def scan():
-    coins = get_top_coins()
-    matching_coins = []
+def get_top_5_cryptos():
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+    headers = {
+        "Accepts": "application/json",
+        "X-CMC_PRO_API_KEY": API_KEY
+    }
+    params = {
+        "start": "1",
+        "limit": "5000",
+        "convert": "USD"
+    }
 
-    for coin in coins:
+    response = requests.get(url, headers=headers, params=params)
+    data = response.json()
+
+    filtered = []
+    for coin in data.get("data", []):
         quote = coin.get("quote", {}).get("USD", {})
         price = quote.get("price")
-        volume = quote.get("volume_24h")
-        change = quote.get("percent_change_1h") or 0
-        symbol = coin.get("symbol")
-        name = coin.get("name")
+        market_cap = quote.get("market_cap")
+        volume_24h = quote.get("volume_24h")
+        percent_change_15m = quote.get("percent_change_15m")
+        percent_change_1h = quote.get("percent_change_1h")
 
-        if not all([price, volume, symbol, name]):
+        timeframe = None
+        if percent_change_15m is not None and percent_change_15m > 10:
+            percent_change = percent_change_15m
+            timeframe = "15m"
+        elif percent_change_1h is not None and percent_change_1h > 10:
+            percent_change = percent_change_1h
+            timeframe = "1h"
+        else:
             continue
-        if not (MIN_PRICE <= price <= MAX_PRICE):
-            continue
-        if volume < MIN_VOLUME:
-            continue
-        if change < MIN_PERCENT_CHANGE:
-            continue
-        if not is_on_kucoin(symbol):
+
+        if None in [price, market_cap, volume_24h, percent_change]:
             continue
 
-        matching_coins.append((symbol, name, price, volume, change))
+        if (
+            0.1 <= price <= 10 and
+            market_cap < 300_000_000 and
+            volume_24h > 500_000
+        ):
+            filtered.append({
+                "symbol": coin.get("symbol"),
+                "name": coin.get("name"),
+                "price": price,
+                "market_cap": market_cap,
+                "volume": volume_24h,
+                "change": percent_change,
+                "timeframe": timeframe
+            })
 
-    if not matching_coins:
-        send_telegram_message("No KuCoin coins found matching the criteria.")
-        return
+    top_5 = sorted(filtered, key=lambda x: x["change"], reverse=True)[:5]
 
-    matching_coins.sort(key=lambda x: x[-1], reverse=True)
-    top_5 = matching_coins[:5]
+    if top_5:
+        message = "\U0001F680 Top 5 Exploding Cryptos:\n"
+        for coin in top_5:
+            message += (f"- {coin['name']} (${coin['symbol']}): {coin['change']:.2f}% ({coin['timeframe']})\n"
+                        f"Price: ${coin['price']:.4f}\nVol: ${coin['volume']:,}\n\n")
+        send_telegram_message(message.strip())
+    else:
+        send_telegram_message("No coins found meeting the criteria.")
 
-    now_str = datetime.now().strftime("%H:%M UTC")
-    msg = f"\U0001F680 *Top 5 KuCoin Cryptos (1H) @ {now_str}*:\n"
-    for coin in top_5:
-        msg += f"- {coin[1]} (${coin[0]}): {coin[4]:.2f}% | Price: ${coin[2]:.4f} | Volume: ${coin[3]:,.2f}\n"
+@app.route("/")
+def home():
+    return "Crypto scanner running..."
 
-    send_telegram_message(msg)
+@app.route("/scan")
+def scan():
+    get_top_5_cryptos()
+    return "Scan done."
 
-# --- Run Loop ---
-if __name__ == '__main__':
-    while True:
-        scan()
-        time.sleep(600)  # run every 10 minutes
+if __name__ == "__main__":
+    def ping_self():
+        while True:
+            try:
+                requests.get("https://crypto-alert-scanner.onrender.com/scan")
+            except:
+                pass
+            time.sleep(600)  # every 10 minutes
+
+    threading.Thread(target=ping_self).start()
+    app.run(host="0.0.0.0", port=10000)
