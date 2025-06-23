@@ -94,7 +94,7 @@ if __name__ == "__main__":
     def ping_self():
         while True:
             try:
-                requests.get("https://crypto-alert-scanner.onrender.com/scan")
+                requests.get("https://your-render-url.onrender.com/scan")
             except:
                 pass
             time.sleep(600)  # every 10 minutes
